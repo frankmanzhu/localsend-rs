@@ -149,6 +149,21 @@ impl HttpDiscovery {
             .await)
     }
 
+    /// Scans a local `/24` using the official discovery operation: send a
+    /// `POST /api/localsend/v2/register` to each host on the configured port.
+    /// This is the fallback used when multicast does not provide a
+    /// confirmation, and is intentionally separate from the legacy `/info`
+    /// compatibility scan.
+    pub async fn scan_subnet_register_within(
+        &self,
+        base_ip: &str,
+        within: Duration,
+    ) -> Result<ScanOutcome> {
+        Ok(self
+            .scan_register_hosts(subnet_hosts(base_ip)?, Some(within))
+            .await)
+    }
+
     /// Probe a caller-supplied set of hosts over the normal LocalSend `/info`
     /// endpoint.  This is useful for routed networks where the caller knows a
     /// reachable address but cannot enumerate it through multicast; it still
@@ -247,6 +262,55 @@ impl HttpDiscovery {
         }
     }
 
+    async fn scan_register_hosts(
+        &self,
+        targets: Vec<String>,
+        within: Option<Duration>,
+    ) -> ScanOutcome {
+        let deadline = within.map(|within| tokio::time::Instant::now() + within);
+        let probes = stream::iter(targets)
+            .map(|ip| async move { self.probe_register_peer(&ip).await })
+            .buffer_unordered(SCAN_CONCURRENCY);
+        futures_util::pin_mut!(probes);
+
+        let mut discovered = Vec::new();
+        let mut complete = true;
+        loop {
+            let next = probes.next();
+            let answered = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, next).await {
+                    Ok(answered) => answered,
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                },
+                None => next.await,
+            };
+            match answered {
+                Some(Some(device)) => discovered.push(device),
+                Some(None) => {}
+                None => break,
+            }
+        }
+
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for device in discovered {
+            if device.fingerprint.is_empty() || device.fingerprint == self.local_device.fingerprint
+            {
+                continue;
+            }
+            if seen.insert(device.fingerprint.clone()) {
+                result.push(device);
+            }
+        }
+        ScanOutcome {
+            devices: result,
+            complete,
+        }
+    }
+
     /// Probe a single host's `/info` endpoint. Tries the configured protocol first and,
     /// like localsend-ts, falls back to the other scheme so an HTTPS scan still finds an
     /// HTTP-only peer (and vice-versa). A host that is unreachable at the TCP level is not
@@ -270,6 +334,20 @@ impl HttpDiscovery {
                     }
                 }
                 ProbeOutcome::RegisterFallback | ProbeOutcome::Miss => continue,
+            }
+        }
+        None
+    }
+
+    async fn probe_register_peer(&self, ip: &str) -> Option<DeviceInfo> {
+        for protocol in self.protocol_candidates() {
+            match self
+                .probe_register_with(ip, self.local_device.port, protocol)
+                .await
+            {
+                ProbeOutcome::Found(device) => return Some(device),
+                ProbeOutcome::Unreachable => return None,
+                ProbeOutcome::Miss | ProbeOutcome::RegisterFallback => continue,
             }
         }
         None
@@ -785,6 +863,72 @@ mod tests {
             .scan_hosts(vec!["127.0.0.1".into()], port, None, false)
             .await;
         assert!(outcome.devices.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server task did not finish")
+            .expect("server task failed");
+    }
+
+    /// The official staged discovery path scans a subnet by sending the
+    /// protocol's `/register` request, not by depending on the legacy
+    /// `/info` endpoint. Keep this as a distinct API from the compatibility
+    /// `/info` scan so callers have to choose the protocol behavior explicitly.
+    #[tokio::test]
+    async fn register_first_subnet_scan_finds_a_register_only_peer() {
+        use crate::{DeviceInfo, Protocol};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind register-only peer");
+        let port = listener.local_addr().expect("peer address").port();
+        let mut peer = DeviceInfo::new("register-only subnet peer".into(), port, Protocol::Http);
+        peer.fingerprint = "register-only-subnet-fingerprint".into();
+        let served = peer.clone();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept register probe");
+            let mut request = [0u8; 4096];
+            let length = stream
+                .read(&mut request)
+                .await
+                .expect("read register probe");
+            let request = String::from_utf8_lossy(&request[..length]);
+            assert!(
+                request.starts_with("POST /api/localsend/v2/register"),
+                "register-first scan must not depend on /info: {request}"
+            );
+            let body = serde_json::to_vec(&served).expect("encode peer");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response headers");
+            stream.write_all(&body).await.expect("write response body");
+        });
+
+        let discovery = HttpDiscovery::new("register-first scanner".into(), port, Protocol::Http)
+            .expect("build discovery");
+        let outcome = discovery
+            .scan_subnet_register_within("127.0.0.2", Duration::from_secs(10))
+            .await
+            .expect("register-first subnet scan");
+
+        let found = outcome
+            .devices
+            .iter()
+            .find(|device| device.fingerprint == "register-only-subnet-fingerprint")
+            .expect("register-only peer must be found by the staged fallback");
+        assert_eq!(found.alias, "register-only subnet peer");
+        assert_eq!(found.ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(found.port, port);
+        assert!(outcome.complete, "the small loopback scan should complete");
+
         tokio::time::timeout(Duration::from_secs(1), server_task)
             .await
             .expect("server task did not finish")

@@ -156,7 +156,6 @@ impl Discovery for MulticastDiscovery {
             let local_fingerprint = self.local_device.fingerprint.clone();
             let running = self.running.clone();
             let local_device = self.local_device.clone();
-            let multicast_addr = SocketAddr::from((self.config.address, self.config.port));
             #[cfg(feature = "https")]
             let client_certificate = self.client_certificate.clone();
 
@@ -193,28 +192,26 @@ impl Discovery for MulticastDiscovery {
                                         ip: Some(src.ip().to_string()),
                                     };
 
-                                    let is_announcement = announcement.announce
-                                        || announcement.announcement.unwrap_or(false);
-                                    let _ = tx.send(device.clone());
+                                    // Multicast is an announcement, not proof that the
+                                    // peer is reachable. Official LocalSend only adds a
+                                    // device after the HTTP /register confirmation.
+                                    let local_device = local_device.clone();
+                                    #[cfg(feature = "https")]
+                                    let client_certificate = client_certificate.clone();
+                                    let tx = tx.clone();
 
-                                    if is_announcement {
-                                        let local_device = local_device.clone();
-                                        let socket = socket.clone();
-                                        #[cfg(feature = "https")]
-                                        let client_certificate = client_certificate.clone();
-
-                                        tokio::spawn(async move {
-                                            Self::respond_to_announcement(
-                                                &device,
-                                                &local_device,
-                                                &socket,
-                                                multicast_addr,
-                                                #[cfg(feature = "https")]
-                                                client_certificate,
-                                            )
-                                            .await;
-                                        });
-                                    }
+                                    tokio::spawn(async move {
+                                        if Self::respond_to_announcement(
+                                            &device,
+                                            &local_device,
+                                            #[cfg(feature = "https")]
+                                            client_certificate,
+                                        )
+                                        .await
+                                        {
+                                            let _ = tx.send(device);
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -415,10 +412,8 @@ impl MulticastDiscovery {
     async fn respond_to_announcement(
         target_device: &DeviceInfo,
         local_device: &DeviceInfo,
-        socket: &UdpSocket,
-        multicast_addr: SocketAddr,
         #[cfg(feature = "https")] client_certificate: Option<crate::crypto::TlsCertificate>,
-    ) {
+    ) -> bool {
         tracing::debug!(
             "Responding to announcement from {} ({:?})",
             target_device.alias,
@@ -443,48 +438,23 @@ impl MulticastDiscovery {
                         "Successfully registered with {} via HTTP",
                         target_device.alias
                     );
-                    return;
+                    return true;
                 }
                 Err(error) => {
-                    // If HTTP failed, we just fall back to UDP. This is common if the other device
-                    // has a strict firewall or if we couldn't parse their response.
-                    // It's not a critical error.
                     tracing::debug!(
-                        "HTTP registration failed ({}), falling back to UDP...",
+                        "HTTP registration failed ({}), ignoring unconfirmed announcement",
                         error
                     );
                 }
             },
             Err(error) => {
                 tracing::debug!(
-                    "Could not configure pinned registration ({}), falling back to UDP...",
+                    "Could not configure pinned registration ({}), ignoring unconfirmed announcement",
                     error
                 );
             }
         }
-
-        // Fallback: Send UDP response
-        let announcement = AnnouncementMessage {
-            alias: local_device.alias.clone(),
-            version: local_device.version.clone(),
-            device_model: local_device.device_model.clone(),
-            device_type: local_device.device_type,
-            fingerprint: local_device.fingerprint.clone(),
-            port: local_device.port,
-            protocol: local_device.protocol,
-            download: local_device.download,
-            announce: false,
-            announcement: Some(false),
-        };
-
-        if let Ok(msg) = serde_json::to_string(&announcement) {
-            let buf = msg.as_bytes();
-            if let Err(e) = socket.send_to(buf, multicast_addr).await {
-                tracing::debug!("Failed to send UDP fallback response: {}", e);
-            } else {
-                tracing::debug!("Sent UDP fallback response to multicast group");
-            }
-        }
+        false
     }
 }
 
