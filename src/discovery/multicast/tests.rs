@@ -213,8 +213,71 @@ fn mask24() -> Ipv4Addr {
     Ipv4Addr::new(255, 255, 255, 0)
 }
 
+use crate::{DeviceInfo, LocalSendServer, Protocol};
+
 #[cfg(feature = "https")]
-use crate::{DeviceInfo, LocalSendServer, Protocol, generate_tls_certificate};
+use crate::generate_tls_certificate;
+
+#[tokio::test]
+async fn announcement_is_confirmed_only_after_http_register_succeeds() {
+    let output = tempfile::tempdir().expect("output directory");
+    let (mut server, _events) = LocalSendServer::builder()
+        .alias("announcing peer")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Http)
+        .build()
+        .await
+        .expect("start HTTP receiver");
+
+    let mut target = server.device().clone();
+    target.ip = Some("127.0.0.1".into());
+    let local = DeviceInfo::new("discovery client".into(), 0, Protocol::Http);
+    let confirmed = MulticastDiscovery::respond_to_announcement(
+        &target,
+        &local,
+        #[cfg(feature = "https")]
+        None,
+    )
+    .await;
+
+    assert!(
+        confirmed,
+        "a reachable announced peer must be confirmed by /register"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn announcement_is_not_reported_when_http_register_fails() {
+    let output = tempfile::tempdir().expect("output directory");
+    let (mut server, _events) = LocalSendServer::builder()
+        .alias("unreachable peer")
+        .port(0)
+        .save_dir(output.path())
+        .protocol(Protocol::Http)
+        .build()
+        .await
+        .expect("start HTTP receiver");
+    let port = server.port();
+    server.stop().await;
+
+    let mut target = DeviceInfo::new("unreachable peer".into(), port, Protocol::Http);
+    target.ip = Some("127.0.0.1".into());
+    let local = DeviceInfo::new("discovery client".into(), 0, Protocol::Http);
+    let confirmed = MulticastDiscovery::respond_to_announcement(
+        &target,
+        &local,
+        #[cfg(feature = "https")]
+        None,
+    )
+    .await;
+
+    assert!(
+        !confirmed,
+        "an unconfirmed announcement must not be surfaced as a peer"
+    );
+}
 
 #[cfg(feature = "https")]
 #[tokio::test]
