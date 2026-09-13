@@ -304,6 +304,25 @@ impl Discovery for MulticastDiscovery {
 }
 
 impl MulticastDiscovery {
+    /// Puts a device confirmed outside of multicast into the discovery
+    /// stream, e.g. one that answered our announcement by registering with
+    /// our HTTP server.
+    ///
+    /// A healthy LocalSend client answers an announcement by POSTing
+    /// `/register` back to the announcer, so the reply to our own
+    /// announcement arrives on the HTTP door and never reaches the multicast
+    /// listener. Official LocalSend feeds those confirmations into the same
+    /// store its listener writes to (`RsDiscovery::add_device`), which makes a
+    /// register reply and an overheard announcement indistinguishable to
+    /// anything awaiting discovery results. Without this path, announcing —
+    /// the fast way to find peers — yields nothing, and callers are left
+    /// waiting for the subnet scan.
+    pub fn add_device(&self, device: DeviceInfo) {
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.send(device);
+        }
+    }
+
     fn multicast_interfaces(interface_names: Option<&BTreeSet<String>>) -> Result<Vec<Ipv4Addr>> {
         let addresses = get_if_addrs()
             .map_err(|error| {
