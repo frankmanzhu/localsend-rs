@@ -292,7 +292,7 @@ fn write_new_identity(cert_path: &Path, key_path: &Path) -> Result<TlsCertificat
 /// Writes `contents` to a uniquely named temporary file beside `path` and
 /// returns that path, ready to be renamed over `path` by [`publish`].
 #[cfg(feature = "https")]
-fn stage_write(path: &Path, contents: &str, private: bool) -> Result<PathBuf> {
+fn stage_write(path: &Path, contents: &str, _private: bool) -> Result<PathBuf> {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -327,7 +327,7 @@ fn stage_write(path: &Path, contents: &str, private: bool) -> Result<PathBuf> {
         ))
     })?;
     #[cfg(unix)]
-    if private {
+    if _private {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|error| {
