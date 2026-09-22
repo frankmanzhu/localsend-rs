@@ -6,6 +6,7 @@ use crate::protocol::{
 use futures_util::StreamExt;
 use reqwest::{Body, Client as HttpClient, StatusCode};
 use std::collections::HashMap;
+#[cfg(feature = "https")]
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio_util::io::ReaderStream;
@@ -16,9 +17,15 @@ pub type ProgressCallback = Box<dyn Fn(u64, u64, f64) + Send + Sync>;
 pub struct LocalSendClient {
     client: HttpClient,
     device: DeviceInfo,
-    pinned_fingerprint: Option<String>,
-    pinned_client: Arc<tokio::sync::Mutex<Option<HttpClient>>>,
-    client_identity: Option<reqwest::Identity>,
+}
+
+#[derive(Clone)]
+struct ClientAuth {
+    identity: reqwest::Identity,
+    #[cfg(feature = "https")]
+    cert_der: Vec<u8>,
+    #[cfg(feature = "https")]
+    key_pem: String,
 }
 
 impl LocalSendClient {
@@ -40,13 +47,7 @@ impl LocalSendClient {
             .tls_backend_rustls()
             .build()
             .expect("a reqwest client with no proxy and no TLS override cannot fail to build");
-        Self {
-            client,
-            device,
-            pinned_fingerprint: None,
-            pinned_client: Arc::new(tokio::sync::Mutex::new(None)),
-            client_identity: None,
-        }
+        Self { client, device }
     }
 
     pub fn with_trust_policy(device: DeviceInfo, policy: TlsTrustPolicy) -> Result<Self> {
@@ -85,53 +86,72 @@ impl LocalSendClient {
         device.fingerprint = certificate.fingerprint.clone();
         let pem = format!("{}\n{}", certificate.cert_pem, certificate.key_pem);
         let identity = reqwest::Identity::from_pem(pem.as_bytes()).map_err(LocalSendError::from)?;
-        Self::with_trust_policy_and_identity(device, policy, Some(identity))
+        Self::with_trust_policy_and_identity(
+            device,
+            policy,
+            Some(ClientAuth {
+                identity,
+                cert_der: certificate.cert_der.clone(),
+                key_pem: certificate.key_pem.clone(),
+            }),
+        )
     }
 
     fn with_trust_policy_and_identity(
         device: DeviceInfo,
         policy: TlsTrustPolicy,
-        client_identity: Option<reqwest::Identity>,
+        client_auth: Option<ClientAuth>,
     ) -> Result<Self> {
         crate::crypto::ensure_crypto_provider();
-        let pinned_fingerprint = match &policy {
-            TlsTrustPolicy::PinnedFingerprint(fingerprint) => Some(
-                crate::client::trust_policy::normalize_fingerprint(fingerprint)
-                    .ok_or_else(|| LocalSendError::network("Invalid LocalSend TLS fingerprint"))?,
-            ),
-            TlsTrustPolicy::InsecureForTests => None,
-        };
         let client = match policy {
             TlsTrustPolicy::InsecureForTests => {
                 let mut builder = HttpClient::builder()
                     .no_proxy()
                     .tls_backend_rustls()
                     .danger_accept_invalid_certs(true);
-                if let Some(identity) = client_identity.clone() {
-                    builder = builder.identity(identity);
+                if let Some(auth) = client_auth {
+                    builder = builder.identity(auth.identity);
                 }
                 builder.build().map_err(LocalSendError::from)?
             }
-            TlsTrustPolicy::PinnedFingerprint(_fingerprint) => {
+            TlsTrustPolicy::PinnedFingerprint(fingerprint) => {
                 #[cfg(feature = "https")]
                 {
-                    let mut builder = HttpClient::builder()
+                    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+                    let verifier = FingerprintVerifier::new(fingerprint)?;
+                    let config = rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(verifier));
+                    let config = if let Some(auth) = client_auth {
+                        let key = PrivateKeyDer::from_pem_slice(auth.key_pem.as_bytes()).map_err(
+                            |error| {
+                                LocalSendError::network(format!(
+                                    "Invalid LocalSend TLS client key: {error}"
+                                ))
+                            },
+                        )?;
+                        config
+                            .with_client_auth_cert(vec![CertificateDer::from(auth.cert_der)], key)
+                            .map_err(|error| {
+                                LocalSendError::network(format!(
+                                    "Invalid LocalSend TLS client identity: {error}"
+                                ))
+                            })?
+                    } else {
+                        config.with_no_client_auth()
+                    };
+                    HttpClient::builder()
                         .no_proxy()
-                        .tls_backend_rustls()
-                        // This client is used only for the certificate bootstrap
-                        // in `client_for_target`; all payload requests use a
-                        // client pinned to the exact leaf certificate.
-                        .danger_accept_invalid_certs(true)
-                        .tls_info(true);
-                    if let Some(identity) = client_identity.clone() {
-                        builder = builder.identity(identity);
-                    }
-                    builder.build().map_err(LocalSendError::from)?
+                        .tls_backend_preconfigured(config)
+                        .build()
+                        .map_err(LocalSendError::from)?
                 }
 
                 #[cfg(not(feature = "https"))]
                 {
-                    let _ = _fingerprint;
+                    let _ = fingerprint;
+                    let _ = client_auth;
                     return Err(LocalSendError::network(
                         "Pinned LocalSend TLS requires the https feature",
                     ));
@@ -139,70 +159,10 @@ impl LocalSendClient {
             }
         };
 
-        Ok(Self {
-            client,
-            device,
-            pinned_fingerprint,
-            pinned_client: Arc::new(tokio::sync::Mutex::new(None)),
-            client_identity,
-        })
-    }
-
-    async fn client_for_target(&self, target: &DeviceInfo) -> Result<HttpClient> {
-        let Some(expected_fingerprint) = self.pinned_fingerprint.as_deref() else {
-            return Ok(self.client.clone());
-        };
-
-        if target.protocol != crate::protocol::Protocol::Https {
-            return Ok(self.client.clone());
-        }
-
-        let mut pinned_client = self.pinned_client.lock().await;
-        if let Some(client) = pinned_client.as_ref() {
-            return Ok(client.clone());
-        }
-
-        let ip = target
-            .ip
-            .as_ref()
-            .ok_or_else(|| LocalSendError::network("Target IP not provided"))?;
-        let url = format!("https://{}:{}/api/localsend/v2/info", ip, target.port);
-        let response = self.client.get(&url).send().await?;
-        let certificate = response
-            .extensions()
-            .get::<reqwest::tls::TlsInfo>()
-            .and_then(reqwest::tls::TlsInfo::peer_certificate)
-            .ok_or_else(|| LocalSendError::network("LocalSend TLS peer certificate unavailable"))?;
-
-        let actual_fingerprint = crate::crypto::sha256_from_bytes(certificate);
-        if crate::client::trust_policy::normalize_fingerprint(&actual_fingerprint)
-            .is_none_or(|actual| actual != expected_fingerprint)
-        {
-            return Err(LocalSendError::network(
-                "LocalSend TLS certificate fingerprint mismatch",
-            ));
-        }
-
-        let certificate = reqwest::Certificate::from_der(certificate).map_err(|error| {
-            LocalSendError::network(format!("Invalid LocalSend TLS certificate: {error}"))
-        })?;
-        let mut builder = HttpClient::builder()
-            .no_proxy()
-            .tls_backend_rustls()
-            .tls_certs_only([certificate])
-            // LocalSend certificates are self-signed for the peer, not for
-            // the numeric IP address used by the discovery announcement.
-            .danger_accept_invalid_hostnames(true);
-        if let Some(identity) = self.client_identity.clone() {
-            builder = builder.identity(identity);
-        }
-        let client = builder.build().map_err(LocalSendError::from)?;
-        *pinned_client = Some(client.clone());
-        Ok(client)
+        Ok(Self { client, device })
     }
 
     pub async fn register(&self, target: &DeviceInfo) -> Result<DeviceInfo> {
-        let client = self.client_for_target(target).await?;
         let ip = target
             .ip
             .as_ref()
@@ -212,7 +172,7 @@ impl LocalSendClient {
             target.protocol, ip, target.port
         );
 
-        let response = client.post(&url).json(&self.device).send().await?;
+        let response = self.client.post(&url).json(&self.device).send().await?;
         let status = response.status();
 
         if status.is_success() {
@@ -248,7 +208,6 @@ impl LocalSendClient {
         files: HashMap<FileId, FileMetadata>,
         pin: Option<&str>,
     ) -> Result<PrepareUploadResponse> {
-        let client = self.client_for_target(target).await?;
         let ip = target
             .ip
             .as_ref()
@@ -267,7 +226,7 @@ impl LocalSendClient {
             files,
         };
 
-        let response = client.post(&url).json(&request).send().await?;
+        let response = self.client.post(&url).json(&request).send().await?;
 
         let status = response.status();
         match status {
@@ -325,7 +284,6 @@ impl LocalSendClient {
         progress: Option<ProgressCallback>,
         rate_limit_bytes_per_second: Option<u64>,
     ) -> Result<()> {
-        let client = self.client_for_target(target).await?;
         let ip = target
             .ip
             .as_ref()
@@ -376,7 +334,8 @@ impl LocalSendClient {
         });
         let body = Body::wrap_stream(counted);
 
-        let response = client
+        let response = self
+            .client
             .post(&url)
             .header(reqwest::header::CONTENT_LENGTH, total_bytes)
             .body(body)
@@ -409,7 +368,6 @@ impl LocalSendClient {
         token: &Token,
         body: Vec<u8>,
     ) -> Result<()> {
-        let client = self.client_for_target(target).await?;
         let ip = target
             .ip
             .as_ref()
@@ -420,7 +378,8 @@ impl LocalSendClient {
         );
 
         let length = body.len() as u64;
-        let response = client
+        let response = self
+            .client
             .post(&url)
             .header(reqwest::header::CONTENT_LENGTH, length)
             .body(body)
@@ -438,7 +397,6 @@ impl LocalSendClient {
     }
 
     pub async fn cancel(&self, target: &DeviceInfo, session_id: &SessionId) -> Result<()> {
-        let client = self.client_for_target(target).await?;
         let ip = target
             .ip
             .as_ref()
@@ -447,7 +405,7 @@ impl LocalSendClient {
             "{}://{}:{}/api/localsend/v2/cancel?sessionId={}",
             target.protocol, ip, target.port, session_id
         );
-        let response = client.post(&url).send().await?;
+        let response = self.client.post(&url).send().await?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -456,6 +414,90 @@ impl LocalSendClient {
                 "Cancel failed",
             ))
         }
+    }
+}
+
+#[cfg(feature = "https")]
+#[derive(Debug)]
+struct FingerprintVerifier {
+    expected_fingerprint: String,
+    signature_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+}
+
+#[cfg(feature = "https")]
+impl FingerprintVerifier {
+    fn new(expected_fingerprint: String) -> Result<Self> {
+        let expected_fingerprint =
+            crate::client::trust_policy::normalize_fingerprint(&expected_fingerprint)
+                .ok_or_else(|| LocalSendError::network("Invalid LocalSend TLS fingerprint"))?;
+
+        crate::crypto::ensure_crypto_provider();
+        let placeholder_certificate = crate::crypto::generate_tls_certificate()?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                placeholder_certificate.cert_der,
+            ))
+            .map_err(|error| {
+                LocalSendError::network(format!("Invalid TLS verifier root: {error}"))
+            })?;
+        let signature_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|error| {
+                LocalSendError::network(format!("TLS verifier setup failed: {error}"))
+            })?;
+
+        Ok(Self {
+            expected_fingerprint,
+            signature_verifier,
+        })
+    }
+}
+
+#[cfg(feature = "https")]
+impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let actual = crate::crypto::sha256_from_bytes(end_entity.as_ref());
+        if crate::client::trust_policy::normalize_fingerprint(&actual)
+            .is_some_and(|actual| actual == self.expected_fingerprint)
+        {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "LocalSend TLS certificate fingerprint mismatch".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.signature_verifier
+            .verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.signature_verifier
+            .verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.signature_verifier.supported_verify_schemes()
     }
 }
 

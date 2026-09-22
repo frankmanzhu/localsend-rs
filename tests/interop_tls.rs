@@ -135,12 +135,92 @@ async fn pinned_client_rejects_a_non_matching_self_signed_leaf() {
     server.stop().await;
 }
 
-/// The full HTTPS send path must present the client certificate on every
-/// connection, not only while discovering the peer. The server below requires
-/// mTLS and exercises the bootstrap `/info`, `/register`, `/prepare-upload`,
-/// and `/upload` requests in sequence.
+/// A peer whose leaf does not match the advertised fingerprint must be
+/// rejected before mutual TLS reveals this device's stable certificate.
 #[tokio::test]
-async fn m_tls_client_survives_bootstrap_and_full_upload() {
+async fn wrong_fingerprint_peer_never_receives_the_client_certificate() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use rustls::server::WebPkiClientVerifier;
+    use rustls::{RootCertStore, ServerConfig};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    let server_certificate = generate_tls_certificate().expect("generate server certificate");
+    let client_certificate = generate_tls_certificate().expect("generate client certificate");
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(client_certificate.cert_der.clone()))
+        .expect("trust the client certificate");
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .expect("build client verifier");
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(
+            vec![CertificateDer::from(server_certificate.cert_der.clone())],
+            PrivateKeyDer::from_pem_slice(server_certificate.key_pem.as_bytes())
+                .expect("read server key"),
+        )
+        .expect("build malicious peer config");
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind malicious peer");
+    let port = listener.local_addr().expect("peer address").port();
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept client");
+        let Ok(Ok(mut stream)) =
+            tokio::time::timeout(Duration::from_secs(2), acceptor.accept(stream)).await
+        else {
+            return false;
+        };
+        let received_client_certificate = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .is_some_and(|certificates| !certificates.is_empty());
+
+        // The old post-handshake check reaches /info, so let it finish and
+        // report the mismatch instead of hanging the test.
+        let mut request = [0u8; 4096];
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request)).await;
+        let body = serde_json::to_vec(&DeviceInfo::new("wrong peer".into(), port, Protocol::Https))
+            .expect("encode peer");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(&body).await;
+        received_client_certificate
+    });
+
+    let mut target = DeviceInfo::new("wrong peer".into(), port, Protocol::Https);
+    target.ip = Some("127.0.0.1".into());
+    target.fingerprint = "f".repeat(64);
+    let sender = DeviceInfo::new("private sender".into(), 0, Protocol::Https);
+    let client = LocalSendClient::with_trust_policy_and_client_certificate(
+        sender,
+        TlsTrustPolicy::new([target.fingerprint.clone()]),
+        &client_certificate,
+    )
+    .expect("pinned client");
+
+    assert!(client.register(&target).await.is_err());
+    assert!(
+        !server_task.await.expect("malicious peer task"),
+        "a wrong-fingerprint peer received the stable client certificate"
+    );
+}
+
+/// The full HTTPS send path must present the client certificate on every
+/// connection. The server below requires mTLS and exercises `/register`,
+/// `/prepare-upload`, and `/upload` in sequence while the leaf fingerprint is
+/// verified inside each TLS handshake.
+#[tokio::test]
+async fn m_tls_client_survives_handshake_pinning_and_full_upload() {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
     use rustls::server::WebPkiClientVerifier;
     use rustls::{RootCertStore, ServerConfig};
@@ -206,7 +286,6 @@ async fn m_tls_client_survives_bootstrap_and_full_upload() {
     let expected_client_fingerprint = client_certificate.fingerprint.clone();
     let server_task = tokio::spawn(async move {
         for expected_path in [
-            "GET /api/localsend/v2/info",
             "POST /api/localsend/v2/register",
             "POST /api/localsend/v2/prepare-upload",
             "POST /api/localsend/v2/upload",
@@ -229,7 +308,7 @@ async fn m_tls_client_survives_bootstrap_and_full_upload() {
             }
 
             let (status, body) = match expected_path {
-                "GET /api/localsend/v2/info" | "POST /api/localsend/v2/register" => (
+                "POST /api/localsend/v2/register" => (
                     "200 OK",
                     serde_json::to_vec(&server_peer).expect("encode peer"),
                 ),
