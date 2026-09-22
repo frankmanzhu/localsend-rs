@@ -355,11 +355,11 @@ impl HttpDiscovery {
 
     /// Ask ONE known peer, at ITS port, whether it is still there.
     ///
-    /// The difference from a scan is which port is used. A sweep is looking for
-    /// strangers and can only assume the well-known port, so it probes with its
-    /// own. A peer we have already met answered somewhere specific, and that is
-    /// not necessarily where we listen — a caller checking whether a known peer
-    /// is still alive has to ask where the peer actually is.
+    /// The difference from a scan is which port is used. A sweep probes every
+    /// stranger on the discovery instance's configured port. A peer we have
+    /// already met answered somewhere specific, which may differ from that
+    /// configured scan port — a caller checking whether a known peer is still
+    /// alive has to ask where the peer actually is.
     ///
     /// This is what a daemon's liveness check runs on. It is unicast, and every
     /// LocalSend client is required to serve it, which makes it evidence about
@@ -1132,11 +1132,10 @@ mod tests {
 
     /// A liveness check asks ONE known peer, at ITS port.
     ///
-    /// A subnet scan uses the protocol's well-known port because it is sweeping
-    /// strangers. A peer we have already met is different: we know where it
-    /// answered, and that is not necessarily where we listen. The scanner here
-    /// is deliberately configured with the wrong port, so a probe that used its
-    /// own would find nothing.
+    /// A subnet scan uses the discovery instance's configured port for every
+    /// stranger. A peer we have already met is different: we know where it
+    /// answered. The scanner here is deliberately configured with the wrong
+    /// scan port, so a probe that used that configured port would find nothing.
     #[tokio::test]
     async fn probe_peer_asks_at_the_peers_own_port() {
         use crate::{LocalSendServer, Protocol};
