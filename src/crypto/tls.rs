@@ -96,6 +96,19 @@ fn is_self_consistent(certificate: &TlsCertificate) -> bool {
         .is_ok()
 }
 
+/// Reads an already usable identity without requiring write access to its
+/// directory. Writers only replace missing or damaged identities, so a pair
+/// that parses and matches here is immutable to every cooperating caller.
+/// A concurrent first-write or repair can only produce a missing/mismatched
+/// read, which falls through to the locked path below and is checked again.
+#[cfg(feature = "https")]
+fn load_valid_identity(cert_path: &Path, key_path: &Path) -> Option<TlsCertificate> {
+    let cert_pem = std::fs::read_to_string(cert_path).ok()?;
+    let key_pem = std::fs::read_to_string(key_path).ok()?;
+    let certificate = tls_certificate_from_pem(cert_pem, key_pem).ok()?;
+    is_self_consistent(&certificate).then_some(certificate)
+}
+
 /// Loads a persisted certificate/key pair, or creates it when neither file
 /// exists. The pair is deliberately caller-owned: applications can choose the
 /// appropriate config directory without making the library guess where user
@@ -122,6 +135,11 @@ pub fn load_or_generate_tls_certificate(
 ) -> Result<TlsCertificate> {
     let cert_path = cert_path.as_ref();
     let key_path = key_path.as_ref();
+
+    if let Some(certificate) = load_valid_identity(cert_path, key_path) {
+        return Ok(certificate);
+    }
+
     let _identity_lock = lock_identity(cert_path)?;
     let cert = std::fs::read_to_string(cert_path);
     let key = std::fs::read_to_string(key_path);
@@ -471,6 +489,29 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_identity_loads_from_a_read_only_directory_without_a_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let certificate_path = directory.path().join("certificate.pem");
+        let key_path = directory.path().join("private-key.pem");
+        let original = load_or_generate_tls_certificate(&certificate_path, &key_path)
+            .expect("create identity");
+        std::fs::remove_file(directory.path().join(".certificate.pem.lock"))
+            .expect("remove the lock file to model an identity created before locking existed");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("make identity directory read-only");
+
+        let loaded = load_or_generate_tls_certificate(&certificate_path, &key_path);
+
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("restore directory permissions for cleanup");
+        let loaded = loaded.expect("a valid existing identity needs no write access");
+        assert_eq!(loaded.fingerprint, original.fingerprint);
     }
 
     /// A pair whose halves belong to different certificates can never complete
