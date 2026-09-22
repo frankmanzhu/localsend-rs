@@ -122,6 +122,7 @@ pub fn load_or_generate_tls_certificate(
 ) -> Result<TlsCertificate> {
     let cert_path = cert_path.as_ref();
     let key_path = key_path.as_ref();
+    let _identity_lock = lock_identity(cert_path)?;
     let cert = std::fs::read_to_string(cert_path);
     let key = std::fs::read_to_string(key_path);
 
@@ -167,6 +168,61 @@ pub fn load_or_generate_tls_certificate(
             key_error
         ))),
     }
+}
+
+/// Serializes readers and writers that share an identity path, including
+/// callers in different processes. The certificate and key are two files, so
+/// no single rename can publish them atomically as one value; holding this lock
+/// across the initial read and any replacement makes the pair atomic to every
+/// caller of this API.
+#[cfg(feature = "https")]
+fn lock_identity(cert_path: &Path) -> Result<std::fs::File> {
+    let parent = cert_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            crate::error::LocalSendError::network(format!(
+                "Failed to create TLS identity directory {}: {}",
+                parent.display(),
+                error
+            ))
+        })?;
+    }
+
+    let file_name = cert_path.file_name().ok_or_else(|| {
+        crate::error::LocalSendError::network(format!(
+            "Invalid TLS identity path: {}",
+            cert_path.display()
+        ))
+    })?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(file_name);
+    lock_name.push(".lock");
+    let lock_path = parent
+        .map(|parent| parent.join(&lock_name))
+        .unwrap_or_else(|| PathBuf::from(&lock_name));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            crate::error::LocalSendError::network(format!(
+                "Failed to open TLS identity lock {}: {}",
+                lock_path.display(),
+                error
+            ))
+        })?;
+    fs2::FileExt::lock_exclusive(&lock).map_err(|error| {
+        crate::error::LocalSendError::network(format!(
+            "Failed to lock TLS identity {}: {}",
+            lock_path.display(),
+            error
+        ))
+    })?;
+    Ok(lock)
 }
 
 /// Generates an identity and publishes it to `cert_path`/`key_path`.
@@ -508,18 +564,36 @@ mod tests {
                 })
                 .collect();
 
-            for thread in threads {
-                if let Ok(certificate) = thread.join().expect("thread panicked") {
-                    assert!(
-                        is_self_consistent(&certificate),
-                        "a concurrent start returned an identity that cannot handshake"
-                    );
-                }
-            }
+            let certificates: Vec<_> = threads
+                .into_iter()
+                .map(|thread| {
+                    thread
+                        .join()
+                        .expect("thread panicked")
+                        .expect("every concurrent start must succeed")
+                })
+                .collect();
 
-            let reloaded = load_or_generate_tls_certificate(&certificate_path, &key_path)
-                .expect("the surviving pair must be loadable");
-            assert!(is_self_consistent(&reloaded));
+            let cert_pem = std::fs::read_to_string(&certificate_path)
+                .expect("read the surviving certificate without auto-repair");
+            let key_pem = std::fs::read_to_string(&key_path)
+                .expect("read the surviving key without auto-repair");
+            let persisted = tls_certificate_from_pem(cert_pem, key_pem)
+                .expect("the surviving pair must parse without auto-repair");
+            assert!(
+                is_self_consistent(&persisted),
+                "the surviving pair must be usable without auto-repair"
+            );
+            for certificate in certificates {
+                assert!(
+                    is_self_consistent(&certificate),
+                    "a concurrent start returned an identity that cannot handshake"
+                );
+                assert_eq!(
+                    certificate.fingerprint, persisted.fingerprint,
+                    "every starter must return the identity that remains on disk"
+                );
+            }
         }
     }
 
