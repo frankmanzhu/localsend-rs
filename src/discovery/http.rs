@@ -120,20 +120,15 @@ impl HttpDiscovery {
     /// (spec §2.2): it finds any device whose HTTP server is reachable, even one that is
     /// missing multicast (lossy Wi-Fi, or a mobile app suspended in the background).
     ///
-    /// Probes run concurrently ([`SCAN_CONCURRENCY`] at a time) on the protocol's
-    /// well-known [`crate::protocol::constants::DEFAULT_HTTP_PORT`]. LocalSend devices use
-    /// self-signed certificates, so the client accepts them — the peer's real fingerprint
-    /// is read from the response, so nothing is trusted blindly. Mirrors localsend-ts
-    /// `HttpDiscovery` and the official `HttpScanDiscoveryService`.
+    /// Probes run concurrently ([`SCAN_CONCURRENCY`] at a time) on the port configured
+    /// for this discovery instance. LocalSend devices use self-signed certificates, so
+    /// the client accepts them — the peer's real fingerprint is read from the response,
+    /// so nothing is trusted blindly. Mirrors localsend-ts `HttpDiscovery` and the
+    /// official `HttpScanDiscoveryService`.
     /// A blind subnet scan never POSTs local device metadata to arbitrary hosts.
     pub async fn scan_subnet(&self, base_ip: &str) -> Result<Vec<DeviceInfo>> {
         Ok(self
-            .scan_hosts(
-                subnet_hosts(base_ip)?,
-                crate::protocol::constants::DEFAULT_HTTP_PORT,
-                None,
-                false,
-            )
+            .scan_hosts(subnet_hosts(base_ip)?, self.local_device.port, None, false)
             .await
             .devices)
     }
@@ -147,7 +142,7 @@ impl HttpDiscovery {
         Ok(self
             .scan_hosts(
                 subnet_hosts(base_ip)?,
-                crate::protocol::constants::DEFAULT_HTTP_PORT,
+                self.local_device.port,
                 Some(within),
                 false,
             )
@@ -165,12 +160,7 @@ impl HttpDiscovery {
     /// discloses this device to it. A blind [`Self::scan_subnet`] never does.
     pub async fn scan_ips(&self, ips: Vec<String>) -> Result<Vec<DeviceInfo>> {
         Ok(self
-            .scan_hosts(
-                ips,
-                crate::protocol::constants::DEFAULT_HTTP_PORT,
-                None,
-                true,
-            )
+            .scan_hosts(ips, self.local_device.port, None, true)
             .await
             .devices)
     }
@@ -178,12 +168,7 @@ impl HttpDiscovery {
     /// [`Self::scan_ips`], abandoned after `within`.
     pub async fn scan_ips_within(&self, ips: Vec<String>, within: Duration) -> Result<ScanOutcome> {
         Ok(self
-            .scan_hosts(
-                ips,
-                crate::protocol::constants::DEFAULT_HTTP_PORT,
-                Some(within),
-                true,
-            )
+            .scan_hosts(ips, self.local_device.port, Some(within), true)
             .await)
     }
 
@@ -808,7 +793,7 @@ mod tests {
 
     #[cfg(feature = "https")]
     #[tokio::test]
-    async fn scan_subnet_finds_a_self_signed_https_server() {
+    async fn scan_ips_honors_the_configured_port_for_a_self_signed_https_server() {
         use crate::{LocalSendServer, Protocol};
 
         let output = tempfile::tempdir().expect("output directory");
@@ -828,9 +813,9 @@ mod tests {
         let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Https)
             .expect("build discovery");
         let found = discovery
-            .scan_hosts(vec!["127.0.0.1".to_string()], server.port(), None, true)
+            .scan_ips(vec!["127.0.0.1".to_string()])
             .await
-            .devices;
+            .expect("scan explicit loopback target");
 
         let target = found
             .iter()
@@ -840,6 +825,38 @@ mod tests {
         assert_eq!(target.ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(target.port, server.port());
         assert_eq!(target.protocol, Protocol::Https);
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn scan_subnet_honors_the_configured_port() {
+        use crate::{LocalSendServer, Protocol};
+
+        let output = tempfile::tempdir().expect("output directory");
+        let (mut server, _events) = LocalSendServer::builder()
+            .alias("custom-port subnet target")
+            .port(0)
+            .save_dir(output.path())
+            .protocol(Protocol::Http)
+            .build()
+            .await
+            .expect("start HTTP receiver");
+        let expected_fingerprint = server.device().fingerprint.clone();
+
+        let discovery = HttpDiscovery::new("scanner".into(), server.port(), Protocol::Http)
+            .expect("build discovery");
+        let found = discovery
+            .scan_subnet("127.0.0.2")
+            .await
+            .expect("scan loopback subnet");
+
+        let target = found
+            .iter()
+            .find(|device| device.fingerprint == expected_fingerprint)
+            .expect("the custom-port server must be discovered through the public API");
+        assert_eq!(target.alias, "custom-port subnet target");
+        assert_eq!(target.port, server.port());
 
         server.stop().await;
     }
