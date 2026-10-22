@@ -454,6 +454,10 @@ struct ReceiveProgressContext {
     received_bytes: Arc<AtomicU64>,
 }
 
+// Rust 1.99 renamed fetch_update to try_update. Keep the existing spelling
+// until the minimum supported compiler reaches 1.99; the atomic behavior is
+// identical, and older consumers must continue to compile.
+#[allow(deprecated)]
 impl ReceiveProgressContext {
     fn add(&self, amount: u64) {
         let previous = self
