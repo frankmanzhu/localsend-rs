@@ -148,24 +148,30 @@ impl PendingRequest {
         &self.files
     }
 
+    /// Send a decision and return the decision if the receiver has already
+    /// closed its response channel (for example, after its consent timeout).
+    pub fn try_respond(self, decision: TransferDecision) -> Result<(), TransferDecision> {
+        self.responder.send(decision)
+    }
+
     /// Accept every offered file. No-op if the sender already timed out.
     pub fn accept(self) {
-        let _ = self.responder.send(TransferDecision::Accept);
+        let _ = self.try_respond(TransferDecision::Accept);
     }
 
     /// Accept a subset of the offered files (empty = decline).
     pub fn accept_files(self, ids: Vec<FileId>) {
-        let _ = self.responder.send(TransferDecision::AcceptFiles(ids));
+        let _ = self.try_respond(TransferDecision::AcceptFiles(ids));
     }
 
     pub fn decline(self) {
-        let _ = self.responder.send(TransferDecision::Decline);
+        let _ = self.try_respond(TransferDecision::Decline);
     }
 
     /// Refuse the offer as unusable. See [`TransferDecision::Refuse`] — this is
     /// not a decline, and the sender is told 400 rather than 403.
     pub fn refuse(self, reason: impl Into<String>) {
-        let _ = self.responder.send(TransferDecision::Refuse {
+        let _ = self.try_respond(TransferDecision::Refuse {
             reason: reason.into(),
         });
     }
@@ -204,5 +210,15 @@ mod tests {
         let (r, rx) = req();
         drop(r);
         assert!(rx.await.is_err()); // handler treats closed channel as decline
+    }
+
+    #[test]
+    fn try_respond_reports_closed_channel_and_preserves_decision() {
+        let (request, receiver) = req();
+        drop(receiver);
+        assert_eq!(
+            request.try_respond(TransferDecision::Accept),
+            Err(TransferDecision::Accept)
+        );
     }
 }
