@@ -26,7 +26,7 @@ async fn approved_browser_session_downloads_exact_bytes() {
         .expect("web share starts");
     assert!(server.device().download);
 
-    let client = reqwest::Client::new();
+    let client = common::http_client();
     let base = format!("http://127.0.0.1:{}", server.port());
     let response = client
         .post(format!("{base}/api/localsend/v2/prepare-download"))
@@ -118,7 +118,7 @@ async fn browser_prepare_waits_for_explicit_approval() {
         "http://127.0.0.1:{}/api/localsend/v2/prepare-download",
         server.port()
     );
-    let request = tokio::spawn(async move { reqwest::Client::new().post(url).send().await });
+    let request = tokio::spawn(async move { common::http_client().post(url).send().await });
     let pending = match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
         .await
         .expect("approval event timeout")
@@ -152,7 +152,7 @@ async fn browser_share_pin_uses_receiver_rate_limit() {
         )
         .await
         .expect("web share starts");
-    let client = reqwest::Client::new();
+    let client = common::http_client();
     let base = format!(
         "http://127.0.0.1:{}/api/localsend/v2/prepare-download",
         server.port()
@@ -205,7 +205,7 @@ async fn browser_share_streams_disk_files_and_rejects_unknown_file_ids() {
         .await
         .expect("web share starts");
 
-    let client = reqwest::Client::new();
+    let client = common::http_client();
     let base = format!("http://127.0.0.1:{}", server.port());
     let body: serde_json::Value = client
         .post(format!("{base}/api/localsend/v2/prepare-download"))
